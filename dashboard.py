@@ -16,219 +16,199 @@ import signal
 from datetime import datetime
 from pathlib import Path
 import base64
-import jproperties # Diperlukan untuk editor server.properties
+import jproperties
+import ruamel.yaml
+import toml
+from pyngrok import ngrok, conf
+from bs4 import BeautifulSoup
+from tqdm.auto import tqdm
 
 # =================================================================================
 # KONFIGURASI DAN PATH UTAMA
-#
-# Di sini kita mendefinisikan semua path dan konstanta utama yang akan digunakan
-# di seluruh aplikasi. Ini membuat kode lebih mudah dikelola.
 # =================================================================================
-
-# Path utama ke folder Google Drive tempat semua data server disimpan.
 DRIVE_PATH = '/content/drive/MyDrive/minecraft'
-
-# Path lengkap ke file konfigurasi utama yang menyimpan daftar server dan pengaturan global.
-SERVER_CONFIG_PATH = os.path.join(DRIVE_PATH, 'server_list.json') # Mengganti nama ke .json agar lebih jelas
-
-# Nama folder untuk menyimpan backup server.
+SERVER_CONFIG_PATH = os.path.join(DRIVE_PATH, 'server_list.json')
 BACKUP_FOLDER_NAME = 'backups'
 
-# Konfigurasi awal yang akan dibuat jika server_list.json tidak ditemukan.
-# Ini berfungsi sebagai template default untuk struktur data aplikasi.
+# Konfigurasi awal yang menggabungkan struktur dari kedua file
 INITIAL_CONFIG = {
     "server_list": [],
     "server_in_use": "",
-    "tunnel_config": {
-        "ngrok": {"authtoken": "", "region": "ap"},
-        "playit": {"secretkey": ""},
-        "zrok": {"authtoken": ""},
-    }
+    "ngrok_proxy": {"authtoken": "", "region": "ap"},
+    "playit_proxy": {"secretkey": ""},
+    "zrok_proxy": {"authtoken": ""},
+    "localtonet_proxy": {"authtoken": ""},
+    "localxpose_proxy": {"authtoken": ""},
+    "tailscale_proxy": {"authtoken": "", "machine_info": ""},
+    "minekube-gate_proxy": {"token": ""}
 }
 
-# Kamus untuk URL API server, memudahkan penambahan tipe server baru di masa depan.
+# Kamus API yang diperluas dari minelab.py
 SERVER_API_URLS = {
     'paper': 'https://api.papermc.io/v2/projects/paper',
     'velocity': 'https://api.papermc.io/v2/projects/velocity',
     'folia': 'https://api.papermc.io/v2/projects/folia',
-    'purpur': 'https://api.purpurmc.org/v2/purpur'
+    'purpur': 'https://api.purpurmc.org/v2/purpur',
+    'mohist': 'https://mohistmc.com/api/v2/projects/mohist',
+    'banner': 'https://mohistmc.com/api/v2/projects/banner'
 }
 
 # =================================================================================
 # INISIALISASI STREAMLIT SESSION STATE
-#
-# Session state adalah cara Streamlit untuk menyimpan variabel di antara interaksi
-# pengguna. Ini penting untuk menjaga status aplikasi, seperti proses server yang
-# sedang berjalan, server mana yang aktif, dll.
 # =================================================================================
-
 def initialize_state():
-    """
-    Menginisialisasi semua variabel session state yang diperlukan oleh aplikasi.
-    Fungsi ini dipanggil sekali di awal eksekusi.
-    """
-    if 'page' not in st.session_state:
-        st.session_state.page = "Beranda"
-    if 'active_server' not in st.session_state:
-        st.session_state.active_server = None
-    if 'server_process' not in st.session_state:
-        st.session_state.server_process = None
-    if 'tunnel_process' not in st.session_state:
-        st.session_state.tunnel_process = None
-    if 'tunnel_address' not in st.session_state:
-        st.session_state.tunnel_address = None
-    if 'server_config' not in st.session_state:
-        st.session_state.server_config = {}
-    if 'log_messages' not in st.session_state:
-        st.session_state.log_messages = []
-    if 'drive_mounted' not in st.session_state:
-        st.session_state.drive_mounted = os.path.exists('/content/drive/MyDrive')
+    """Menginisialisasi semua variabel session state yang diperlukan."""
+    session_defaults = {
+        'page': "🏠 Beranda",
+        'active_server': None,
+        'server_process': None,
+        'tunnel_process': None,
+        'tunnel_address': None,
+        'server_config': {},
+        'log_messages': [],
+        'drive_mounted': os.path.exists('/content/drive/MyDrive'),
+        'current_path': DRIVE_PATH,
+        'active_server_fm': None
+    }
+    for key, value in session_defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
 
 # =================================================================================
 # FUNGSI-FUNGSI HELPER (BACKEND LOGIC)
-#
-# Kumpulan fungsi yang melakukan tugas-tugas backend seperti menjalankan perintah,
-# mengelola file, berinteraksi dengan API, dll.
+# Diadaptasi dan digabungkan dari kedua file
 # =================================================================================
 
-def run_command(command, cwd=None, capture_output=True):
-    """
-    Menjalankan perintah shell dan menangkap outputnya.
-    Fungsi ini adalah pembungkus (wrapper) di sekitar subprocess.run.
-
-    Args:
-        command (str): Perintah yang akan dijalankan.
-        cwd (str, optional): Direktori kerja saat ini untuk perintah. Defaults to None.
-        capture_output (bool, optional): Apakah akan menangkap output stdout/stderr. Defaults to True.
-
-    Returns:
-        subprocess.CompletedProcess or None: Hasil dari eksekusi perintah, atau None jika gagal.
-    """
+def run_command(command, cwd=None, capture_output=True, shell=True):
+    """Menjalankan perintah shell dengan logging."""
     try:
         st.info(f"⚙️ Menjalankan: `{command}`")
         result = subprocess.run(
-            command,
-            shell=True,
-            check=True,
-            capture_output=capture_output,
-            text=True,
-            cwd=cwd
+            command, shell=shell, check=True, capture_output=capture_output, text=True, cwd=cwd
         )
+        if result.stdout:
+            st.code(result.stdout, language="bash")
         return result
     except subprocess.CalledProcessError as e:
         st.error(f"❌ Error saat menjalankan perintah: {command}")
-        st.code(e.stderr, language="bash")
+        st.code(e.stderr or "Tidak ada output error.", language="bash")
         return None
 
 def load_server_config():
-    """
-    Memuat konfigurasi global dari file server_list.json.
-    Jika file tidak ada atau rusak, file akan dibuat ulang dari template.
-    """
+    """Memuat konfigurasi global dari server_list.json, menangani migrasi jika perlu."""
     if os.path.exists(SERVER_CONFIG_PATH):
         try:
             with open(SERVER_CONFIG_PATH, 'r') as f:
                 config = json.load(f)
-                # Migrasi dari struktur lama jika diperlukan
-                if "ngrok_proxy" in config:
-                    st.warning("Migrating old config structure to new structure.")
-                    config["tunnel_config"] = {
-                        "ngrok": config.pop("ngrok_proxy", {"authtoken": "", "region": "ap"}),
-                        "playit": config.pop("playit_proxy", {"secretkey": ""}),
-                        "zrok": config.pop("zrok_proxy", {"authtoken": ""})
-                    }
-                st.session_state.server_config = config
-                st.session_state.active_server = config.get('server_in_use', None)
+            # Pastikan semua kunci proxy ada
+            for key, value in INITIAL_CONFIG.items():
+                if key.endswith("_proxy") and key not in config:
+                    config[key] = value
+            st.session_state.server_config = config
+            st.session_state.active_server = config.get('server_in_use', None)
         except json.JSONDecodeError:
-            st.warning("⚠️ File server_list.json rusak. Membuat file baru dari template.")
+            st.warning("⚠️ File server_list.json rusak. Membuat file baru.")
             save_server_config(INITIAL_CONFIG)
     else:
         st.session_state.server_config = INITIAL_CONFIG
 
 def save_server_config(config_data=None):
-    """
-    Menyimpan data konfigurasi yang diberikan (atau dari session state) ke server_list.json.
-
-    Args:
-        config_data (dict, optional): Data konfigurasi untuk disimpan. Defaults to None.
-    """
+    """Menyimpan data konfigurasi ke server_list.json."""
     if config_data is None:
         config_data = st.session_state.server_config
     os.makedirs(DRIVE_PATH, exist_ok=True)
     with open(SERVER_CONFIG_PATH, 'w') as f:
         json.dump(config_data, f, indent=4)
-    st.session_state.server_config = config_data # Pastikan state sinkron
+    st.session_state.server_config = config_data # Sinkronkan state
 
 def get_server_info(command, server_type=None, version=None):
-    """
-    Mengambil informasi server (tipe, versi, URL download) dari berbagai API.
-    Fungsi ini memusatkan semua logika pengambilan data server.
-
-    Args:
-        command (str): Perintah yang diminta ("GetServerTypes", "GetVersions", "GetDownloadUrl").
-        server_type (str, optional): Tipe server (e.g., 'paper', 'vanilla').
-        version (str, optional): Versi server.
-
-    Returns:
-        list or str or None: Hasil dari query, bisa berupa daftar string, sebuah string, atau None.
-    """
+    """Fungsi komprehensif dari minelab.py untuk mendapatkan info server."""
     try:
         if command == "GetServerTypes":
-            return ['paper', 'purpur', 'vanilla', 'fabric', 'folia', 'velocity', 'bedrock']
+            return ['vanilla', 'paper', 'purpur', 'fabric', 'forge', 'folia', 'velocity', 'bedrock', 'mohist', 'arclight', 'snapshot']
+        
         elif command == "GetVersions":
-            if server_type == "bedrock": return ["latest"]
-            elif server_type == 'vanilla':
+            if not server_type: return []
+            if server_type == "bedrock":
+                link = get_bedrock_download_link()
+                match = re.search(r'bedrock-server-([\d\.]+)\.zip', link)
+                return [match.group(1)] if match else ["latest"]
+            elif server_type in ['vanilla', 'snapshot']:
                 r = requests.get('https://launchermeta.mojang.com/mc/game/version_manifest.json').json()
-                return [v['id'] for v in r['versions'] if v['type'] == 'release']
+                stype = 'release' if server_type == 'vanilla' else 'snapshot'
+                return [v['id'] for v in r['versions'] if v['type'] == stype]
             elif server_type in SERVER_API_URLS:
-                return requests.get(SERVER_API_URLS[server_type]).json()["versions"]
+                return requests.get(SERVER_API_URLS[server_type]).json().get("versions", [])
             elif server_type == 'fabric':
                 return [v['version'] for v in requests.get('https://meta.fabricmc.net/v2/versions/game').json() if v.get('stable', False)]
-            else:
-                return ["1.20.4", "1.20.1", "1.19.4", "1.18.2", "1.16.5"]
+            elif server_type == 'forge':
+                r = requests.get('https://files.minecraftforge.net/net/minecraftforge/forge/index.html')
+                soup = BeautifulSoup(r.content, "html.parser")
+                return [a.text.strip() for a in soup.select('.versions-list a')]
+            elif server_type == "arclight":
+                r = requests.get('https://files.hypoglycemia.icu/v1/files/arclight/minecraft').json()
+                return [hit['name'] for hit in r.get('files', [])]
+            return []
+
         elif command == "GetDownloadUrl":
-            if server_type == 'bedrock':
-                page = requests.get("https://www.minecraft.net/en-us/download/server/bedrock/", headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
-                page.raise_for_status()
-                soup = __import__('bs4').BeautifulSoup(page.content, "html.parser")
-                link = soup.find('a', href=re.compile(r'https://minecraft\.azureedge\.net/bin-linux/bedrock-server-.*\.zip'))['href']
-                return link
+            if not server_type or (server_type != 'bedrock' and not version): return None
+            if server_type == 'bedrock': return get_bedrock_download_link()
+            elif server_type in ['vanilla', 'snapshot']:
+                manifest = requests.get('https://launchermeta.mojang.com/mc/game/version_manifest.json').json()
+                version_url = next((v['url'] for v in manifest['versions'] if v['id'] == version), None)
+                return requests.get(version_url).json()['downloads']['server']['url'] if version_url else None
             elif server_type in SERVER_API_URLS:
                 builds_url = f'{SERVER_API_URLS[server_type]}/versions/{version}/builds'
                 build = requests.get(builds_url).json()["builds"][-1]
                 download_info_url = f'{SERVER_API_URLS[server_type]}/versions/{version}/builds/{build}'
                 jar_name = requests.get(download_info_url).json()["downloads"]["application"]["name"]
                 return f'{download_info_url}/downloads/{jar_name}'
-            elif server_type == 'vanilla':
-                 manifest = requests.get('https://launchermeta.mojang.com/mc/game/version_manifest.json').json()
-                 version_info_url = next((v['url'] for v in manifest['versions'] if v['id'] == version), None)
-                 if version_info_url:
-                     version_info = requests.get(version_info_url).json()
-                     return version_info['downloads']['server']['url']
-            else:
-                 st.warning(f"URL download otomatis untuk {server_type} belum diimplementasikan. Harap gunakan URL manual.")
-                 return None
+            elif server_type == 'fabric':
+                api_url = f'https://meta.fabricmc.net/v2/versions/loader/{version}'
+                loaders = requests.get(api_url).json()
+                if not loaders: return None
+                loader_ver = loaders[0]["loader"]["version"]
+                installer_ver_url = 'https://meta.fabricmc.net/v2/versions/installer'
+                installer_ver = requests.get(installer_ver_url).json()[0]["version"]
+                return f"https://meta.fabricmc.net/v2/versions/loader/{version}/{loader_ver}/{installer_ver}/server/jar"
+            elif server_type == 'forge':
+                r = requests.get(f'https://files.minecraftforge.net/net/minecraftforge/forge/index_{version}.html')
+                soup = BeautifulSoup(r.content, "html.parser")
+                installer_link_tag = soup.find('div', class_='link-boosted').find('a')
+                if installer_link_tag and 'href' in installer_link_tag.attrs:
+                    installer_link = installer_link_tag['href']
+                    return installer_link.split('url=')[-1]
+            # URL untuk Arclight memerlukan input tambahan, jadi lebih baik ditangani di UI
     except Exception as e:
-        st.error(f"Gagal mengambil info server: {e}")
-        return None
+        st.error(f"Gagal mengambil info server untuk {server_type} {version}: {e}")
+    return None
+
+def get_bedrock_download_link():
+    """Mengambil link download Bedrock dari sumber utama atau backup."""
+    try:
+        page = requests.get("https://www.minecraft.net/en-us/download/server/bedrock/", headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
+        page.raise_for_status()
+        soup = BeautifulSoup(page.content, "html.parser")
+        link = soup.find('a', href=re.compile(r'https://minecraft\.azureedge\.net/bin-linux/bedrock-server-.*\.zip'))
+        if link: return link['href']
+    except requests.exceptions.RequestException as e:
+        st.warning(f"Gagal akses situs resmi Minecraft ({e}), mencoba backup.")
+    try:
+        response = requests.get("https://raw.githubusercontent.com/MinaasaZillowArte/Minecraft-Bedrock-Server-Updater/main/backup_download_link.txt", timeout=20)
+        response.raise_for_status()
+        return response.text.strip()
+    except Exception as e:
+        st.error(f"Gagal mengambil link dari backup: {e}")
+    return None
 
 def download_file(url, directory, filename):
-    """
-    Mengunduh file dari URL dengan progress bar visual di Streamlit.
-
-    Args:
-        url (str): URL sumber file.
-        directory (str): Direktori tujuan untuk menyimpan file.
-        filename (str): Nama file yang akan disimpan.
-    """
+    """Mengunduh file dengan progress bar visual."""
     os.makedirs(directory, exist_ok=True)
     filepath = os.path.join(directory, filename)
-
     progress_bar = st.progress(0, text=f"Menyiapkan unduhan untuk {filename}...")
     status_text = st.empty()
-
     try:
-        with requests.get(url, stream=True, headers={'User-Agent': 'Mozilla/5.0'}, timeout=20) as r:
+        with requests.get(url, stream=True, headers={'User-Agent': 'Mozilla/5.0'}, timeout=30) as r:
             r.raise_for_status()
             total_size = int(r.headers.get('content-length', 0))
             bytes_downloaded = 0
@@ -244,36 +224,41 @@ def download_file(url, directory, filename):
         progress_bar.empty()
     except requests.exceptions.RequestException as e:
         status_text.error(f"Gagal mengunduh file: {e}")
-        if os.path.exists(filepath):
-            os.remove(filepath)
+        if os.path.exists(filepath): os.remove(filepath)
 
 def kill_process(proc, name="Proses"):
-    """
-    Menghentikan proses subprocess dengan aman.
-
-    Args:
-        proc (subprocess.Popen): Objek proses yang akan dihentikan.
-        name (str): Nama proses untuk pesan log.
-    """
+    """Menghentikan proses subprocess dengan aman."""
     if proc:
         st.warning(f"Mengirim sinyal penghentian ke {name} (PID: {proc.pid})...")
-        # Kirim sinyal SIGTERM dulu, ini lebih 'sopan'
-        proc.terminate()
         try:
-            # Beri waktu 10 detik untuk berhenti secara normal
+            os.kill(proc.pid, signal.SIGTERM)
             proc.wait(timeout=10)
             st.success(f"{name} berhasil dihentikan.")
-        except subprocess.TimeoutExpired:
-            # Jika masih berjalan, paksa hentikan
+        except (ProcessLookupError, subprocess.TimeoutExpired):
             st.error(f"{name} tidak merespon, menghentikan secara paksa (KILL).")
-            proc.kill()
-            proc.wait() # Tunggu sampai proses benar-benar mati
+            os.kill(proc.pid, signal.SIGKILL)
+            proc.wait()
+        except Exception as e:
+            st.error(f"Error saat menghentikan proses: {e}")
 
+def get_colab_config(server_name):
+    """Membaca file colabconfig.json untuk server tertentu."""
+    config_path = os.path.join(DRIVE_PATH, server_name, 'colabconfig.json')
+    if os.path.exists(config_path):
+        with open(config_path, 'r') as f:
+            return json.load(f)
+    return {}
+
+def save_colab_config(server_name, data):
+    """Menyimpan data ke colabconfig.json untuk server tertentu."""
+    server_path = os.path.join(DRIVE_PATH, server_name)
+    os.makedirs(server_path, exist_ok=True)
+    config_path = os.path.join(server_path, 'colabconfig.json')
+    with open(config_path, 'w') as f:
+        json.dump(data, f, indent=4)
+        
 # =================================================================================
 # FUNGSI UNTUK MERENDER HALAMAN (FRONTEND UI)
-#
-# Setiap fungsi di sini bertanggung jawab untuk menampilkan satu halaman
-# di antarmuka Streamlit.
 # =================================================================================
 
 def render_home_page():
@@ -299,12 +284,13 @@ def render_home_page():
             os.makedirs(DRIVE_PATH, exist_ok=True)
             if not os.path.exists(SERVER_CONFIG_PATH):
                 save_server_config(INITIAL_CONFIG)
-                st.success(f"✅ Folder `minecraft` dan `{os.path.basename(SERVER_CONFIG_PATH)}` berhasil dibuat di Google Drive Anda.")
+                st.success(f"✅ Folder `minecraft` dan `{os.path.basename(SERVER_CONFIG_PATH)}` berhasil dibuat.")
             else:
                 st.info("ℹ️ Folder dan file konfigurasi sudah ada.")
 
-        with st.spinner("Menginstal library yang dibutuhkan (jproperties, beautifulsoup4)..."):
-            run_command("pip install -q jproperties beautifulsoup4")
+        with st.spinner("Menginstal library yang dibutuhkan..."):
+            libs = "jproperties beautifulsoup4 ruamel.yaml pyngrok toml tqdm"
+            run_command(f"pip install -q {libs}")
             st.success("✅ Library yang dibutuhkan sudah siap.")
 
         st.balloons()
@@ -326,22 +312,23 @@ def render_server_management_page():
     with tab1:
         st.subheader("Buat Server Minecraft Baru")
         with st.form("create_server_form"):
-            server_name = st.text_input("Nama Server (tanpa spasi/simbol)", placeholder="Contoh: SurvivalKu, CreativeWorld")
-            server_type = st.selectbox("Tipe Server", get_server_info("GetServerTypes"), help="Pilih jenis perangkat lunak server yang ingin Anda gunakan.")
+            server_name = st.text_input("Nama Server (tanpa spasi/simbol)", placeholder="Contoh: SurvivalKu")
+            server_type = st.selectbox("Tipe Server", get_server_info("GetServerTypes"), index=0)
             
             versions = get_server_info("GetVersions", server_type=server_type)
-            if versions:
-                version = st.selectbox(f"Versi untuk {server_type}", versions)
-            else:
-                version = st.text_input(f"Versi untuk {server_type}", "latest")
+            version = st.selectbox(f"Versi untuk {server_type}", versions) if versions else st.text_input(f"Versi untuk {server_type}", "latest")
+            
+            tunnel_service = st.selectbox("Layanan Tunnel", ["", "ngrok", "playit", "zrok", "localtonet"], help="Pilih layanan untuk membuat server Anda dapat diakses publik.")
 
-            ram_allocation = st.slider("Alokasi RAM (GB)", min_value=2, max_value=12, value=4, step=1, help="Jumlah RAM yang akan dialokasikan ke server Java. Direkomendasikan 4-6 GB.")
+            ram_allocation = st.slider("Alokasi RAM (GB)", min_value=2, max_value=12, value=4, step=1)
 
             submitted = st.form_submit_button("Buat Server", type="primary")
 
             if submitted:
                 if not server_name or not re.match("^[a-zA-Z0-9_-]+$", server_name):
                     st.error("Nama server tidak valid. Gunakan hanya huruf, angka, -, dan _.")
+                elif not version:
+                    st.error("Versi server harus diisi.")
                 else:
                     server_path = os.path.join(DRIVE_PATH, server_name)
                     if os.path.exists(server_path):
@@ -354,51 +341,69 @@ def render_server_management_page():
                                 "server_type": server_type,
                                 "server_version": version,
                                 "ram_gb": ram_allocation,
+                                "tunnel_service": tunnel_service,
                                 "creation_date": datetime.now().isoformat()
                             }
-                            with open(os.path.join(server_path, 'colabconfig.json'), 'w') as f:
-                                json.dump(colab_config, f, indent=4)
+                            save_colab_config(server_name, colab_config)
                             
                             st.info("Mencari URL download...")
                             dl_url = get_server_info("GetDownloadUrl", server_type=server_type, version=version)
                             
                             if dl_url:
-                                st.success(f"URL ditemukan! Memulai unduhan untuk {server_type} {version}...")
-                                filename = 'bedrock-server.zip' if server_type == 'bedrock' else f"{server_type}-{version}.jar"
+                                st.success(f"URL ditemukan! Memulai unduhan...")
+                                if server_type == 'bedrock':
+                                    filename = 'bedrock-server.zip'
+                                elif server_type == 'forge':
+                                    filename = f'forge-{version}-installer.jar'
+                                else:
+                                    # Coba dapatkan nama file dari URL
+                                    try:
+                                        filename = dl_url.split('/')[-1].split('?')[0]
+                                        if not filename.endswith('.jar'): filename = f"{server_type}-{version}.jar"
+                                    except:
+                                        filename = f"{server_type}-{version}.jar"
+                                        
                                 download_file(dl_url, server_path, filename)
+                                file_path = os.path.join(server_path, filename)
 
-                                if server_type == 'bedrock' and os.path.exists(os.path.join(server_path, filename)):
-                                    st.info("Mengekstrak file server Bedrock...")
-                                    with zipfile.ZipFile(os.path.join(server_path, filename), 'r') as zip_ref:
-                                        zip_ref.extractall(server_path)
-                                    os.remove(os.path.join(server_path, filename))
-                                
-                                config = st.session_state.server_config
-                                if server_name not in config['server_list']:
-                                    config['server_list'].append(server_name)
-                                config['server_in_use'] = server_name
-                                save_server_config(config)
-                                
-                                st.success(f"Server '{server_name}' berhasil dibuat dan ditetapkan sebagai aktif!")
-                                st.balloons()
-                                st.rerun()
+                                if os.path.exists(file_path):
+                                    if server_type == 'bedrock':
+                                        st.info("Mengekstrak file server Bedrock...")
+                                        with zipfile.ZipFile(file_path, 'r') as zip_ref:
+                                            zip_ref.extractall(server_path)
+                                        os.remove(file_path)
+                                    
+                                    if server_type == 'forge':
+                                        st.info("Menjalankan installer Forge...")
+                                        run_command(f'java -jar {filename} --installServer', cwd=server_path)
+                                        st.success("Installer Forge selesai.")
+                                    
+                                    config = st.session_state.server_config
+                                    if server_name not in config['server_list']:
+                                        config['server_list'].append(server_name)
+                                    config['server_in_use'] = server_name
+                                    save_server_config(config)
+                                    
+                                    st.success(f"Server '{server_name}' berhasil dibuat dan ditetapkan sebagai aktif!")
+                                    st.balloons()
+                                    st.rerun()
+                                else:
+                                    st.error("File server tidak ditemukan setelah diunduh.")
+                                    shutil.rmtree(server_path)
                             else:
                                 st.error("Gagal mendapatkan URL download. Proses dibatalkan.")
                                 shutil.rmtree(server_path)
 
     with tab2:
         st.subheader("Hapus Server")
-        st.warning("🚨 **PERINGATAN:** Aksi ini akan menghapus folder server dan isinya secara permanen dan tidak dapat dibatalkan.")
+        st.warning("🚨 **PERINGATAN:** Aksi ini akan menghapus folder server dan isinya secara permanen.")
         server_list = st.session_state.server_config.get('server_list', [])
         if not server_list:
             st.info("Tidak ada server untuk dihapus.")
         else:
             server_to_delete = st.selectbox("Pilih server yang akan dihapus", options=[""] + server_list, key="delete_select")
             if server_to_delete:
-                st.markdown(f"Untuk konfirmasi, ketik nama server **`{server_to_delete}`** di bawah ini.")
-                confirmation = st.text_input("Ketik nama server untuk konfirmasi", key="delete_confirm")
-                
-                if st.button("Hapus Permanen", type="secondary", disabled=(confirmation != server_to_delete)):
+                if st.button("Hapus Permanen", type="secondary"):
                     with st.spinner(f"Menghapus server '{server_to_delete}'..."):
                         server_path = os.path.join(DRIVE_PATH, server_to_delete)
                         
@@ -422,27 +427,21 @@ def render_console_page():
     active_server = st.session_state.get('active_server')
 
     if not active_server:
-        st.warning("Tidak ada server aktif yang dipilih. Silakan pilih dari sidebar atau buat server baru.")
+        st.warning("Tidak ada server aktif. Pilih dari sidebar atau buat yang baru.")
         return
 
     server_path = os.path.join(DRIVE_PATH, active_server)
-    if not os.path.exists(server_path):
-        st.error(f"Folder untuk server '{active_server}' tidak ditemukan! Mungkin telah dihapus secara manual. Pilih server lain.")
+    colab_config = get_colab_config(active_server)
+    if not colab_config:
+        st.error(f"File 'colabconfig.json' tidak ditemukan untuk server '{active_server}'. Tidak dapat memulai.")
         return
 
-    # Baca config lokal server
-    try:
-        with open(os.path.join(server_path, 'colabconfig.json'), 'r') as f:
-            colab_config = json.load(f)
-        server_type = colab_config.get("server_type", "Tidak diketahui")
-        ram_gb = colab_config.get("ram_gb", 4)
-    except FileNotFoundError:
-        st.error("File 'colabconfig.json' tidak ditemukan untuk server ini. Tidak dapat memulai.")
-        return
-        
-    st.info(f"Server Aktif: **{active_server}** (Tipe: {server_type}, RAM: {ram_gb}GB)")
+    server_type = colab_config.get("server_type", "Tidak diketahui")
+    ram_gb = colab_config.get("ram_gb", 4)
+    tunnel_service = colab_config.get("tunnel_service")
 
-    # --- Kontrol Server & Tunnel ---
+    st.info(f"Server Aktif: **{active_server}** (Tipe: {server_type}, RAM: {ram_gb}GB, Tunnel: {tunnel_service or 'Tidak ada'})")
+
     st.markdown("---")
     st.subheader("Kontrol Utama")
 
@@ -452,17 +451,40 @@ def render_console_page():
     with col1:
         if st.button("▶️ Mulai Server", type="primary", disabled=is_running, use_container_width=True):
             with st.spinner("Mempersiapkan dan memulai server..."):
-                # Setujui EULA untuk server Java
+                # 1. Setujui EULA
                 if server_type != 'bedrock':
-                    eula_path = os.path.join(server_path, 'eula.txt')
-                    if not os.path.exists(eula_path):
-                        with open(eula_path, 'w') as f:
-                            f.write('eula=true')
-                        st.toast("EULA disetujui secara otomatis.")
+                    with open(os.path.join(server_path, 'eula.txt'), 'w') as f: f.write('eula=true')
+                
+                # 2. Konfigurasi dan mulai Tunnel
+                if tunnel_service:
+                    # Di sini kita akan memasukkan logika dari `konfigurasi_tunnel` minelab.py
+                    # Untuk kesederhanaan, kita mulai dengan ngrok
+                    if tunnel_service == 'ngrok':
+                        global_config = st.session_state.server_config
+                        ngrok_config = global_config.get('ngrok_proxy', {})
+                        token = ngrok_config.get('authtoken')
+                        region = ngrok_config.get('region', 'ap')
+                        if not token:
+                            st.error("Authtoken Ngrok tidak diatur! Atur di halaman 'Pengaturan & Optimasi'.")
+                            return
 
-                # Tentukan perintah start
+                        try:
+                            ngrok.set_auth_token(token)
+                            conf.get_default().region = region
+                            port = 19132 if server_type == 'bedrock' else 25565
+                            proto = 'udp' if server_type == 'bedrock' else 'tcp'
+                            tunnel = ngrok.connect(port, proto)
+                            st.session_state.tunnel_address = tunnel.public_url
+                            st.success(f"✅ Tunnel Ngrok aktif di: {st.session_state.tunnel_address}")
+                        except Exception as e:
+                            st.error(f"Gagal memulai tunnel Ngrok: {e}")
+                            return
+                    # TODO: Implementasikan logika untuk playit, zrok, dll.
+                    
+                # 3. Tentukan perintah start
                 if server_type == 'bedrock':
                     command = f"LD_LIBRARY_PATH=. ./bedrock_server"
+                    cmd_list = command.split()
                 else: # Java-based
                     jar_files = [f for f in os.listdir(server_path) if f.endswith('.jar') and 'installer' not in f.lower()]
                     if not jar_files:
@@ -471,18 +493,13 @@ def render_console_page():
                     jar_name = jar_files[0]
                     java_args = f"-Xms{ram_gb}G -Xmx{ram_gb}G -XX:+UseG1GC -XX:+ParallelRefProcEnabled -XX:MaxGCPauseMillis=200 -XX:+UnlockExperimentalVMOptions -XX:+DisableExplicitGC -XX:+AlwaysPreTouch -XX:G1NewSizePercent=30 -XX:G1MaxNewSizePercent=40 -XX:G1HeapRegionSize=8M -XX:G1ReservePercent=20 -XX:G1HeapWastePercent=5 -XX:G1MixedGCCountTarget=4 -XX:InitiatingHeapOccupancyPercent=15 -XX:G1MixedGCLiveThresholdPercent=90 -XX:G1RSetUpdatingPauseTimePercent=5 -XX:SurvivorRatio=32 -XX:+PerfDisableSharedMem -XX:MaxTenuringThreshold=1 -Dusing.aikars.flags=true"
                     command = f"java {java_args} -jar {jar_name} nogui"
+                    cmd_list = command.split()
 
-                # Jalankan proses server
-                st.session_state.log_messages = [f"[{datetime.now():%H:%M:%S}] Starting server with command: {command}"]
+                # 4. Jalankan proses server
+                st.session_state.log_messages = [f"[{datetime.now():%H:%M:%S}] Memulai server..."]
                 process = subprocess.Popen(
-                    command.split(), 
-                    cwd=server_path, 
-                    stdout=subprocess.PIPE, 
-                    stderr=subprocess.STDOUT, 
-                    stdin=subprocess.PIPE,
-                    text=True, 
-                    bufsize=1,
-                    universal_newlines=True
+                    cmd_list, cwd=server_path, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, 
+                    stdin=subprocess.PIPE, text=True, bufsize=1, universal_newlines=True
                 )
                 st.session_state.server_process = process
                 st.success("Server sedang dimulai!")
@@ -490,137 +507,78 @@ def render_console_page():
 
     with col2:
         if st.button("🛑 Hentikan Server", type="secondary", disabled=not is_running, use_container_width=True):
-            with st.spinner("Menghentikan server..."):
+            with st.spinner("Menghentikan server dan tunnel..."):
                 if st.session_state.get('server_process'):
-                    if server_type == 'bedrock':
-                        kill_process(st.session_state.server_process, "Server Bedrock")
-                    else:
-                        st.info("Mengirim perintah 'stop' ke server Java...")
-                        st.session_state.server_process.stdin.write("stop\n")
-                        st.session_state.server_process.stdin.flush()
+                    proc = st.session_state.server_process
+                    if server_type != 'bedrock':
+                        proc.stdin.write("stop\n")
+                        proc.stdin.flush()
                         try:
-                            st.session_state.server_process.wait(timeout=30)
-                            st.success("Server berhenti dengan normal.")
+                            proc.wait(timeout=30)
                         except subprocess.TimeoutExpired:
-                            st.warning("Server tidak berhenti, akan dihentikan paksa.")
-                            kill_process(st.session_state.server_process, "Server Java")
-                    
-                st.session_state.server_process = None
+                            kill_process(proc, "Server")
+                    else:
+                        kill_process(proc, "Server")
+                    st.session_state.server_process = None
+                
+                # Hentikan tunnel
+                if st.session_state.get('tunnel_address'):
+                    ngrok.kill()
+                    st.session_state.tunnel_address = None
+                    st.info("Tunnel Ngrok dihentikan.")
+
                 st.session_state.log_messages.append(f"[{datetime.now():%H:%M:%S}] Server dihentikan oleh pengguna.")
                 time.sleep(1)
                 st.rerun()
 
-    # --- Tampilan Log dan Input Perintah ---
+    if st.session_state.tunnel_address:
+        st.success(f"Alamat Server: `{st.session_state.tunnel_address.replace('tcp://', '').replace('udp://', '')}`")
+
     st.markdown("---")
     st.subheader("Log Konsol & Perintah")
-
     log_container = st.container(height=500, border=True)
     with log_container:
         log_placeholder = st.empty()
     
-    command_input = st.text_input(
-        "Kirim Perintah ke Server", 
-        key="command_input", 
-        disabled=not is_running,
-        placeholder="Contoh: list, op <nama_pemain>, say Halo Semua"
-    )
+    command_input = st.text_input("Kirim Perintah", key="command_input", disabled=not is_running)
 
     if command_input and st.session_state.server_process:
-        st.session_state.server_process.stdin.write(command_input + "\n")
-        st.session_state.server_process.stdin.flush()
+        proc = st.session_state.server_process
+        proc.stdin.write(command_input + "\n")
+        proc.stdin.flush()
         st.toast(f"Perintah '{command_input}' dikirim!")
         st.session_state.log_messages.append(f"> {command_input}")
-        # Hapus text_input setelah dikirim agar tidak dikirim ulang saat rerun
         st.session_state.command_input = ""
 
-    # Loop untuk membaca log secara live jika server berjalan
     if is_running:
         try:
             line = st.session_state.server_process.stdout.readline()
             if line:
                 st.session_state.log_messages.append(line.strip())
-                # Batasi jumlah log agar tidak membebani browser
                 if len(st.session_state.log_messages) > 300:
                     st.session_state.log_messages.pop(0)
-
-            # Update tampilan log
+            
             log_placeholder.code('\n'.join(st.session_state.log_messages), language="log")
 
-            # Cek jika proses sudah mati
             if st.session_state.server_process.poll() is not None:
                 st.warning("⚠️ Proses server telah berhenti.")
                 st.session_state.server_process = None
-                time.sleep(3)
+                if st.session_state.tunnel_address:
+                    ngrok.kill()
+                    st.session_state.tunnel_address = None
                 st.rerun()
             else:
-                # Rerun secara otomatis untuk update log berikutnya
                 time.sleep(0.5)
                 st.rerun()
 
         except Exception as e:
-            st.error(f"Terjadi error saat membaca log: {e}")
+            st.error(f"Error membaca log: {e}")
     else:
         log_placeholder.code('\n'.join(st.session_state.log_messages), language="log")
-        st.info("Server tidak sedang berjalan. Mulai server untuk melihat log live.")
 
 def render_properties_editor_page():
-    """Menampilkan editor untuk file server.properties."""
-    st.header("⚙️ Editor Properti Server")
-    active_server = st.session_state.get('active_server')
-    if not active_server:
-        st.warning("Pilih server aktif terlebih dahulu.")
-        return
-
-    server_path = os.path.join(DRIVE_PATH, active_server)
-    properties_path = os.path.join(server_path, 'server.properties')
-
-    if not os.path.exists(properties_path):
-        st.info("`server.properties` tidak ditemukan. Jalankan server setidaknya sekali untuk membuatnya secara otomatis.")
-        return
-
-    st.info("Edit pengaturan umum server Anda di sini. Perubahan akan aktif setelah server di-restart.")
-
-    # Muat properti
-    properties = jproperties.Properties()
-    with open(properties_path, 'rb') as f:
-        properties.load(f, "utf-8")
-
-    # Tampilkan dalam form
-    with st.form("properties_form"):
-        # Kelompokkan pengaturan untuk UI yang lebih baik
-        st.subheader("Pengaturan Dunia")
-        properties['level-name'] = st.text_input("Nama Dunia (level-name)", properties.get('level-name', 'world').data)
-        properties['gamemode'] = st.selectbox("Gamemode", ['survival', 'creative', 'adventure', 'spectator'], index=['survival', 'creative', 'adventure', 'spectator'].index(properties.get('gamemode', 'survival').data))
-        properties['difficulty'] = st.selectbox("Kesulitan (difficulty)", ['peaceful', 'easy', 'normal', 'hard'], index=['peaceful', 'easy', 'normal', 'hard'].index(properties.get('difficulty', 'normal').data))
-        properties['allow-flight'] = st.toggle("Izinkan Terbang (allow-flight)", value=(properties.get('allow-flight', 'false').data == 'true'))
-
-        st.subheader("Pengaturan Server")
-        properties['max-players'] = st.slider("Pemain Maksimal (max-players)", 1, 100, int(properties.get('max-players', '20').data))
-        properties['view-distance'] = st.slider("Jarak Pandang (view-distance)", 2, 32, int(properties.get('view-distance', '10').data))
-        properties['motd'] = st.text_area("Deskripsi Server (MOTD)", properties.get('motd', 'A Minecraft Server').data.replace('\\u00A7', '§'))
-        properties['pvp'] = st.toggle("Aktifkan PvP", value=(properties.get('pvp', 'true').data == 'true'))
-        properties['online-mode'] = st.toggle("Mode Online (Verifikasi Akun)", value=(properties.get('online-mode', 'true').data == 'true'), help="Nonaktifkan jika Anda ingin mengizinkan pemain bajakan (tidak disarankan).")
-
-        if st.form_submit_button("Simpan Perubahan", type="primary"):
-            try:
-                # Konversi nilai boolean kembali ke string
-                for key in ['allow-flight', 'pvp', 'online-mode']:
-                    if isinstance(properties[key], bool):
-                        properties[key] = str(properties[key]).lower()
-
-                # Simpan kembali ke file
-                with open(properties_path, "wb") as f:
-                    # jproperties.store memerlukan komentar, kita beri saja timestamp
-                    comment = f"Last updated from MineLab Dashboard on {datetime.now()}"
-                    properties.store(f, comment=comment, encoding="utf-8")
-                st.success("✅ Properti server berhasil disimpan!")
-            except Exception as e:
-                st.error(f"Gagal menyimpan properti: {e}")
-
-
-def render_player_manager_page():
-    """Menampilkan halaman untuk mengelola ops, whitelist, dan banned players."""
-    st.header("👥 Manajemen Pemain")
+    """Menampilkan editor untuk server.properties dan file YAML."""
+    st.header("⚙️ Editor Konfigurasi Server")
     active_server = st.session_state.get('active_server')
     if not active_server:
         st.warning("Pilih server aktif terlebih dahulu.")
@@ -628,105 +586,104 @@ def render_player_manager_page():
 
     server_path = os.path.join(DRIVE_PATH, active_server)
     
-    def manage_player_list(file_name, title):
-        """Fungsi helper untuk mengelola satu file JSON pemain."""
-        st.subheader(title)
-        file_path = os.path.join(server_path, file_name)
-        
-        players = []
-        if os.path.exists(file_path):
-            try:
+    tab_prop, tab_yml, tab_icon = st.tabs(["server.properties", "File Konfigurasi (YAML)", "Ikon Server"])
+
+    with tab_prop:
+        properties_path = os.path.join(server_path, 'server.properties')
+        if not os.path.exists(properties_path):
+            st.info("`server.properties` tidak ditemukan. Jalankan server sekali untuk membuatnya.")
+        else:
+            properties = jproperties.Properties()
+            with open(properties_path, 'rb') as f:
+                properties.load(f, "utf-8")
+            with st.form("properties_form"):
+                st.subheader("Pengaturan Umum")
+                # Menggunakan iterator untuk menampilkan semua properti
+                updated_props = {}
+                for key, value in properties.items():
+                    updated_props[key] = st.text_input(key, value.data)
+                
+                if st.form_submit_button("Simpan Perubahan", type="primary"):
+                    for key, value in updated_props.items():
+                        properties[key] = value
+                    with open(properties_path, "wb") as f:
+                        comment = f"Last updated from MineLab Dashboard on {datetime.now()}"
+                        properties.store(f, comment=comment, encoding="utf-8")
+                    st.success("✅ Properti server berhasil disimpan!")
+    
+    with tab_yml:
+        st.info("Editor ini untuk file `.yml` seperti `bukkit.yml`, `spigot.yml`, `paper-world-defaults.yml`.")
+        yaml_files = [f for f in os.listdir(server_path) if f.endswith('.yml')]
+        if not yaml_files:
+            st.info("Tidak ada file .yml yang ditemukan di folder root server.")
+        else:
+            selected_yml = st.selectbox("Pilih file YAML untuk diedit", yaml_files)
+            if selected_yml:
+                file_path = os.path.join(server_path, selected_yml)
                 with open(file_path, 'r') as f:
-                    players_data = json.load(f)
-                # Ekstrak nama pemain, format bisa berbeda
-                players = [p.get('name', p.get('displayName')) for p in players_data if p.get('name') or p.get('displayName')]
-            except (json.JSONDecodeError, TypeError):
-                st.error(f"File {file_name} rusak atau formatnya tidak dikenali.")
-                return
+                    content = f.read()
+                
+                with st.form("yaml_edit_form"):
+                    edited_content = st.text_area("Konten File", content, height=500)
+                    if st.form_submit_button("Simpan File YAML"):
+                        try:
+                            yaml_parser = ruamel.yaml.YAML()
+                            yaml_parser.load(edited_content) # Validasi sintaks
+                            with open(file_path, 'w') as f:
+                                f.write(edited_content)
+                            st.success(f"✅ File `{selected_yml}` berhasil disimpan!")
+                        except Exception as e:
+                            st.error(f"Gagal menyimpan, error sintaks YAML: {e}")
 
-        st.text_area(f"Daftar Pemain di {file_name}", "\n".join(players), key=f"list_{file_name}", height=150)
-
-        with st.form(key=f"form_{file_name}"):
-            player_name_add = st.text_input("Tambah Pemain (Nama Pengguna)", key=f"add_{file_name}")
-            player_name_remove = st.selectbox("Hapus Pemain", [""] + players, key=f"remove_{file_name}")
-            
-            col1, col2 = st.columns(2)
-            add_submitted = col1.form_submit_button("Tambah")
-            remove_submitted = col2.form_submit_button("Hapus")
-
-            if add_submitted and player_name_add:
-                # Logika ini perlu disesuaikan karena format file bisa beda
-                # Untuk kesederhanaan, kita anggap server akan mengurus UUID
-                if st.session_state.get('server_process'):
-                    st.session_state.server_process.stdin.write(f"{title.lower().split()[0]} add {player_name_add}\n")
-                    st.session_state.server_process.stdin.flush()
-                    st.success(f"Perintah untuk menambahkan '{player_name_add}' ke {title} telah dikirim. Cek konsol.")
-                    st.rerun()
-                else:
-                    st.warning("Server harus berjalan untuk menambahkan pemain dengan benar (untuk mendapatkan UUID).")
-
-            if remove_submitted and player_name_remove:
-                if st.session_state.get('server_process'):
-                    st.session_state.server_process.stdin.write(f"{title.lower().split()[0]} remove {player_name_remove}\n")
-                    st.session_state.server_process.stdin.flush()
-                    st.success(f"Perintah untuk menghapus '{player_name_remove}' dari {title} telah dikirim. Cek konsol.")
-                    st.rerun()
-                else:
-                    st.warning("Server harus berjalan untuk menghapus pemain dengan benar.")
-
-    tab_ops, tab_whitelist, tab_banned = st.tabs(["Operator (OP)", "Whitelist", "Pemain Dilarang (Banned)"])
-    
-    with tab_ops:
-        manage_player_list("ops.json", "Operator Server")
+    with tab_icon:
+        st.subheader("Ubah Ikon Server (server-icon.png)")
+        icon_path = os.path.join(server_path, 'server-icon.png')
+        if os.path.exists(icon_path):
+            st.image(icon_path, caption="Ikon saat ini")
         
-    with tab_whitelist:
-        st.toggle("Aktifkan Whitelist?", help="Jika aktif, hanya pemain di daftar ini yang bisa masuk.")
-        manage_player_list("whitelist.json", "Whitelist")
-
-    with tab_banned:
-        manage_player_list("banned-players.json", "Pemain Dilarang")
-
+        uploaded_icon = st.file_uploader("Unggah ikon baru (harus 64x64px, format PNG)", type=['png'])
+        if uploaded_icon:
+            with open(icon_path, 'wb') as f:
+                f.write(uploaded_icon.getbuffer())
+            st.success("Ikon server berhasil diubah! Restart server untuk menerapkan.")
+            st.rerun()
 
 def render_file_manager_page():
-    """Menampilkan file manager sederhana untuk upload/download."""
+    """Menampilkan file manager sederhana."""
     st.header("🗂️ Manajer File")
     active_server = st.session_state.get('active_server')
     if not active_server:
         st.warning("Pilih server aktif terlebih dahulu.")
         return
 
-    server_path = Path(DRIVE_PATH) / active_server
+    server_root_path = Path(DRIVE_PATH) / active_server
     
-    # Navigasi folder
     if 'current_path' not in st.session_state or st.session_state.get('active_server_fm') != active_server:
-        st.session_state.current_path = str(server_path)
+        st.session_state.current_path = str(server_root_path)
         st.session_state.active_server_fm = active_server
 
     current_path = Path(st.session_state.current_path)
 
-    st.info(f"Lokasi saat ini: `{current_path.relative_to(DRIVE_PATH)}`")
+    st.info(f"Lokasi: `{current_path.relative_to(Path(DRIVE_PATH))}`")
 
-    # Tombol "Naik satu level"
-    if current_path != server_path:
+    if current_path != server_root_path:
         if st.button("⬆️ Naik satu level"):
             st.session_state.current_path = str(current_path.parent)
             st.rerun()
 
-    # Upload file
     with st.expander("📤 Unggah File ke Folder Ini"):
-        uploaded_files = st.file_uploader("Pilih file untuk diunggah", accept_multiple_files=True)
+        uploaded_files = st.file_uploader("Pilih file", accept_multiple_files=True, key="file_uploader")
         if uploaded_files:
             for uploaded_file in uploaded_files:
                 with open(current_path / uploaded_file.name, "wb") as f:
                     f.write(uploaded_file.getbuffer())
             st.success(f"{len(uploaded_files)} file berhasil diunggah!")
             st.rerun()
-
-    # Daftar file dan folder
+            
     items = sorted(list(current_path.iterdir()), key=lambda p: (not p.is_dir(), p.name.lower()))
     
     for item in items:
-        col1, col2, col3 = st.columns([4, 2, 2])
+        col1, col2, col3, col4 = st.columns([4, 2, 2, 3])
         icon = "📁" if item.is_dir() else "📄"
         
         with col1:
@@ -743,63 +700,152 @@ def render_file_manager_page():
         with col3:
             if item.is_file():
                 with open(item, "rb") as file:
-                    st.download_button(
-                        label="📥 Unduh",
-                        data=file,
-                        file_name=item.name,
-                        key=f"dl_{item.name}",
-                        use_container_width=True
-                    )
+                    st.download_button("📥 Unduh", file, item.name, key=f"dl_{item.name}", use_container_width=True)
+        
+        with col4:
+            if item.name.endswith('.zip'):
+                if st.button("Extract Zip", key=f"unzip_{item.name}", use_container_width=True):
+                    with st.spinner(f"Mengekstrak {item.name}..."):
+                        with zipfile.ZipFile(item, 'r') as zip_ref:
+                            zip_ref.extractall(current_path)
+                        st.success("Ekstraksi selesai.")
+                        st.rerun()
+
+def render_software_mods_page():
+    """Halaman untuk mengelola software server, plugin, dan mod."""
+    st.header("🧩 Perangkat Lunak & Mod")
+    active_server = st.session_state.get('active_server')
+    if not active_server:
+        st.warning("Pilih server aktif terlebih dahulu.")
+        return
+
+    colab_config = get_colab_config(active_server)
+    server_type = colab_config.get("server_type")
+    
+    tab_install, tab_update = st.tabs(["Instal Plugin/Mod", "Perbarui Server (Bedrock)"])
+    
+    with tab_install:
+        st.subheader("Instal dari CurseForge / Modrinth")
+        if server_type in ['bedrock', 'vanilla']:
+            st.warning(f"Tipe server '{server_type}' tidak mendukung plugin/mod.")
+            return
+
+        platform = st.radio("Pilih Platform", ["Modrinth", "CurseForge"])
+        search_query = st.text_input("Cari nama plugin/mod...")
+        
+        if st.button("Cari"):
+            with st.spinner(f"Mencari '{search_query}' di {platform}..."):
+                # Di sini kita akan implementasikan logika pencarian dari minelab.py
+                # Ini adalah contoh sederhana
+                st.info("Fitur pencarian sedang dalam pengembangan.")
+                # TODO: Implementasi API call ke Modrinth/Curseforge
+    
+    with tab_update:
+        st.subheader("Perbarui Server Bedrock")
+        if server_type != 'bedrock':
+            st.warning("Fitur ini hanya untuk server Bedrock.")
+            return
+
+        st.info("Fitur ini akan mengunduh versi server Bedrock terbaru dan menimpa file yang ada.")
+        if st.button("Perbarui ke Versi Terbaru", type="primary"):
+            with st.spinner("Memeriksa versi terbaru..."):
+                latest_url = get_bedrock_download_link()
+                if not latest_url:
+                    st.error("Tidak dapat menemukan URL download terbaru.")
+                    return
+                
+                server_path = os.path.join(DRIVE_PATH, active_server)
+                download_file(latest_url, server_path, 'bedrock-update.zip')
+                
+                update_zip_path = os.path.join(server_path, 'bedrock-update.zip')
+                if os.path.exists(update_zip_path):
+                    with st.spinner("Mengekstrak pembaruan..."):
+                        with zipfile.ZipFile(update_zip_path, 'r') as zip_ref:
+                            zip_ref.extractall(server_path)
+                        os.remove(update_zip_path)
+                    st.success("Server Bedrock berhasil diperbarui!")
+                else:
+                    st.error("Gagal mengunduh file pembaruan.")
+
+def render_settings_page():
+    """Halaman untuk pengaturan global seperti token tunnel."""
+    st.header("🔧 Pengaturan Global & Optimasi")
+    
+    tab_tunnels, tab_optimize = st.tabs(["Konfigurasi Tunnel", "Optimasi Performa"])
+    
+    with tab_tunnels:
+        st.subheader("API Keys & Authtokens")
+        config = st.session_state.server_config
+        
+        with st.form("tunnels_form"):
+            st.write("**Ngrok**")
+            ngrok_token = st.text_input("Authtoken Ngrok", value=config.get('ngrok_proxy', {}).get('authtoken', ''), type="password")
+            ngrok_region = st.selectbox("Region Ngrok", ['us', 'eu', 'ap', 'au', 'sa', 'jp', 'in'], index=['us', 'eu', 'ap', 'au', 'sa', 'jp', 'in'].index(config.get('ngrok_proxy', {}).get('region', 'ap')))
+
+            st.write("**Playit.gg**")
+            playit_key = st.text_input("Secret Key Playit.gg", value=config.get('playit_proxy', {}).get('secretkey', ''), type="password")
+
+            st.write("**Zrok**")
+            zrok_token = st.text_input("Authtoken Zrok", value=config.get('zrok_proxy', {}).get('authtoken', ''), type="password")
+            
+            if st.form_submit_button("Simpan Pengaturan Tunnel"):
+                config['ngrok_proxy'] = {'authtoken': ngrok_token, 'region': ngrok_region}
+                config['playit_proxy'] = {'secretkey': playit_key}
+                config['zrok_proxy'] = {'authtoken': zrok_token}
+                save_server_config(config)
+                st.success("Pengaturan tunnel berhasil disimpan!")
+
+    with tab_optimize:
+        st.subheader("Optimasi Performa Server (Java)")
+        st.warning("Fitur ini akan mengubah file konfigurasi server Anda (`spigot.yml`, `paper-world-defaults.yml`, dll.) untuk meningkatkan TPS. Gunakan dengan hati-hati.")
+        active_server = st.session_state.get('active_server')
+        if not active_server:
+            st.warning("Pilih server aktif terlebih dahulu.")
+            return
+
+        if st.button("Terapkan Optimasi"):
+            # Di sini akan dimasukkan logika dari sel "Server Improvement" minelab.py
+            st.info("Fitur optimasi sedang dalam pengembangan.")
+            # TODO: Implementasi modifikasi file YAML menggunakan ruamel.yaml
+
 # =================================================================================
 # FUNGSI UTAMA DAN NAVIGASI
 # =================================================================================
-
 def main():
-    """
-    Fungsi utama yang menjalankan aplikasi Streamlit.
-    Mengatur konfigurasi halaman, menginisialisasi state, dan merender sidebar
-    serta halaman yang dipilih.
-    """
     st.set_page_config(page_title="MineLab Dashboard", layout="wide", initial_sidebar_state="expanded")
 
     initialize_state()
 
-    # Hanya muat config jika drive sudah terhubung
     if st.session_state.drive_mounted:
         load_server_config()
 
-    # --- Sidebar ---
     with st.sidebar:
         st.image("https://i.ibb.co/N2gzkBB5/1753179481600-bdab5bfb-616b-4c1e-bdf9-5377de7aa5ec.png", width=70)
         st.title("MineLab")
         st.markdown("---")
 
-        # Cek apakah persiapan awal sudah dilakukan
         if not st.session_state.drive_mounted:
-            st.warning("Jalankan 'Persiapan Awal' di halaman Beranda untuk memulai.")
+            st.warning("Jalankan 'Persiapan Awal' di halaman Beranda.")
         else:
             server_list = st.session_state.server_config.get('server_list', [])
-            if server_list:
-                try:
-                    current_index = server_list.index(st.session_state.active_server) if st.session_state.active_server in server_list else 0
-                except (ValueError, TypeError):
-                    current_index = 0
+            try:
+                current_index = server_list.index(st.session_state.active_server) if st.session_state.active_server in server_list else 0
+            except (ValueError, TypeError):
+                current_index = 0
 
-                selected = st.selectbox(
-                    "Pilih Server Aktif",
-                    server_list,
-                    index=current_index,
-                    key="server_selector"
-                )
-                if selected and selected != st.session_state.active_server:
-                    st.session_state.active_server = selected
-                    st.session_state.server_config['server_in_use'] = selected
-                    save_server_config()
-                    st.toast(f"Server aktif diganti ke: {selected}")
-                    time.sleep(1)
-                    st.rerun()
-            else:
-                st.info("Belum ada server. Buat di 'Manajemen Server'.")
+            selected = st.selectbox(
+                "Pilih Server Aktif", server_list, index=current_index, key="server_selector"
+            )
+            if selected and selected != st.session_state.active_server:
+                st.session_state.active_server = selected
+                st.session_state.server_config['server_in_use'] = selected
+                save_server_config()
+                # Reset path file manager saat ganti server
+                st.session_state.current_path = os.path.join(DRIVE_PATH, selected)
+                st.session_state.active_server_fm = selected
+                st.toast(f"Server aktif diganti ke: {selected}")
+                time.sleep(1)
+                st.rerun()
 
             st.markdown("---")
             st.header("Menu Navigasi")
@@ -807,21 +853,20 @@ def main():
                 "🏠 Beranda": render_home_page,
                 "🖥️ Konsol & Kontrol": render_console_page,
                 "🛠️ Manajemen Server": render_server_management_page,
-                "⚙️ Editor Properti": render_properties_editor_page,
-                "👥 Manajemen Pemain": render_player_manager_page,
+                "⚙️ Editor Konfigurasi": render_properties_editor_page,
+                "🧩 Perangkat Lunak & Mod": render_software_mods_page,
                 "🗂️ Manajer File": render_file_manager_page,
+                "🔧 Pengaturan & Optimasi": render_settings_page,
             }
             
-            page_selection = st.radio("Pilih Halaman", list(pages.keys()), label_visibility="collapsed")
-            st.session_state.page = page_selection
+            page_selection = st.radio("Pilih Halaman", list(pages.keys()), key="page_selector")
+            if st.session_state.page != page_selection:
+                 st.session_state.page = page_selection
+                 st.rerun()
 
-    # --- Halaman Utama ---
-    # Panggil fungsi render yang sesuai dengan pilihan di sidebar
-    page_function = pages.get(st.session_state.page)
-    if page_function:
-        page_function()
-    else:
-        render_home_page() # Default ke Beranda jika terjadi kesalahan
+
+    # Render halaman yang dipilih
+    pages.get(st.session_state.page, render_home_page)()
 
 if __name__ == "__main__":
     main()
